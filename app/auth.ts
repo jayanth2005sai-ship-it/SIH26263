@@ -1,0 +1,6 @@
+import { redirect } from 'next/navigation';
+import { getChatGPTUser } from './chatgpt-auth';
+import { getGoogleUser,isGoogleAuth } from '../lib/google-auth-server';
+import { safeReturnTo } from '../lib/google-oidc';
+export async function getWorkspaceUser(){return isGoogleAuth()?getGoogleUser():getChatGPTUser();}
+export async function requireWorkspaceUser(returnTo:string){const user=await getWorkspaceUser();if(user)return user;const path=safeReturnTo(returnTo);redirect(isGoogleAuth()?'/login?returnTo='+encodeURIComponent(path):'/signin-with-chatgpt?return_to='+encodeURIComponent(path));}

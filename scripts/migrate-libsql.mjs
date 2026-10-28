@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 nextEnv.loadEnvConfig(process.cwd());
 const url = process.env.TURSO_DATABASE_URL;
 if (!url) throw new Error('Set TURSO_DATABASE_URL before applying migrations.');
-const db = createClient({ url, authToken: process.env.TURSO_AUTH_TOKEN });
+const db = createClient({ url, authToken: process.env.TURSO_AUTH_TOKEN ?? process.env.TURSO_DATABASE_AUTH_TOKEN });
 const migrationDirectory = fileURLToPath(new URL('../drizzle/', import.meta.url));
 await db.execute('CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY NOT NULL, applied_at TEXT NOT NULL)');
 for (const name of readdirSync(migrationDirectory).filter(value => /^\d{4}_.*\.sql$/.test(value)).sort()) {

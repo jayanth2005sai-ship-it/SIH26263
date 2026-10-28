@@ -5,6 +5,6 @@ import * as schema from "./schema";
 export function getDb() {
   const url = process.env.TURSO_DATABASE_URL;
   if (!url) throw new Error('TURSO_DATABASE_URL is required.');
-  const client = createClient({ url, authToken: process.env.TURSO_AUTH_TOKEN });
+  const client = createClient({ url, authToken: process.env.TURSO_AUTH_TOKEN ?? process.env.TURSO_DATABASE_AUTH_TOKEN });
   return drizzle(client, { schema });
 }

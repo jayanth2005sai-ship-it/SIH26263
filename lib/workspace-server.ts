@@ -1,9 +1,9 @@
-import { env } from 'cloudflare:workers';
+import { database as siteDatabase } from './vercel-database';
 import { evaluateRoster, validateRow, outcome, maskApaar, categories, dateValue, type Institution, type Programme, type Student, type Batch, type Snapshot, type AuditEvent, type ReportRow, type Review, type Finding } from './domain';
 
 type Data = {institutions:Institution[]; programmes:Programme[]; students:Student[]; batches:Batch[]; audit:AuditEvent[];reviews:Review[]};
 export class InputError extends Error { constructor(message:string, public status=400,public findings?:unknown){super(message);} }
-function database(){const db=(env as {DB?:D1Database}).DB;if(!db)throw new Error('The workspace database is unavailable.');return db;}
+function database(){return siteDatabase;}
 const now=()=>new Date().toISOString();
 const text=(v:unknown,max=200)=>typeof v==='string'?v.trim().slice(0,max):'';
 const uuid=()=>crypto.randomUUID();

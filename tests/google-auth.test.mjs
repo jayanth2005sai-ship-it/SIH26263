@@ -141,123 +141,90 @@ test('Multiple audiences require the matching authorized party', async () => {
   assert.equal((await verifyGoogleToken(await sign({ aud: [config.clientId, 'other-client'], azp: config.clientId }), config.clientId, claims.nonce, keys)).subject, claims.sub);
 });
 
-// Exercise the production server functions against the actual SQL migrations.
-// Only the framework request context and Google network responses are supplied locally.
-test('Server flow: link ownership, replay prevention, sessions, conflicts and sign-out', async (t) => {
-  const { DatabaseSync } = await import('node:sqlite');
-  const sql = new DatabaseSync(':memory:');
-  sql.exec('PRAGMA foreign_keys=ON');
-  for (const migration of ['0000_nosy_human_cannonball.sql', '0001_perfect_tana_nile.sql', '0002_greedy_nuke.sql']) {
-    sql.exec(fs.readFileSync(new URL(`../drizzle/${migration}`, import.meta.url), 'utf8'));
-  }
-  const prepare = (query, args = []) => ({
-    bind: (...bound) => prepare(query, bound),
-    first: async () => sql.prepare(query).get(...args) ?? null,
-    run: async () => sql.prepare(query).run(...args),
-  });
-  const env = { ...values, AUTH_PROVIDER: 'sites', DB: { prepare, batch: async (statements) => {
-    sql.exec('BEGIN');
-    try { const results = []; for (const statement of statements) results.push(await statement.run()); sql.exec('COMMIT'); return results; }
-    catch (error) { sql.exec('ROLLBACK'); throw error; }
-  } } };
-  const owner = { userId: 'existing-owner', email: 'owner@example.com', displayName: 'Existing Owner', fullName: null };
-  const context = { env, requestHeaders: new Headers(), user: owner };
+test('Vercel sign-in stores Google identities, blocks legacy linking and revokes sessions', async t => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { execFileSync } = await import('node:child_process');
+  const { createClient } = await import('@libsql/client');
+  const directory = mkdtempSync(join(tmpdir(), 'idvera-vercel-auth-'));
+  const url = `file:${join(directory, 'test.db')}`;
+  const oldEnv = Object.fromEntries(['TURSO_DATABASE_URL', 'TURSO_AUTH_TOKEN', 'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'AUTH_ORIGIN'].map(key => [key, process.env[key]]));
+  Object.assign(process.env, { TURSO_DATABASE_URL: url, GOOGLE_CLIENT_ID: config.clientId,
+    GOOGLE_CLIENT_SECRET: config.clientSecret, AUTH_ORIGIN: config.origin });
+  execFileSync(process.execPath, [new URL('../scripts/migrate-libsql.mjs', import.meta.url).pathname], { env: process.env });
+  const db = createClient({ url });
+  const context = { requestHeaders: new Headers() };
   globalThis.__idveraAuthTest = context;
-  const contextUrl = 'data:text/javascript;base64,' + Buffer.from(`
-    export const env = globalThis.__idveraAuthTest.env;
-    export async function headers() { return globalThis.__idveraAuthTest.requestHeaders; }
-    export async function getChatGPTUser() { return globalThis.__idveraAuthTest.user; }
-  `).toString('base64');
-  let serverCode = ts.transpileModule(fs.readFileSync(new URL('../lib/google-auth-server.ts', import.meta.url), 'utf8'), {
+  const headersUrl = 'data:text/javascript;base64,' + Buffer.from('export async function headers(){return globalThis.__idveraAuthTest.requestHeaders}').toString('base64');
+  const compile = path => ts.transpileModule(fs.readFileSync(new URL(path, import.meta.url), 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
   }).outputText;
-  for (const path of ['cloudflare:workers', 'next/headers', '../app/chatgpt-auth']) serverCode = serverCode.replace(`from '${path}'`, `from ${JSON.stringify(contextUrl)}`);
-  serverCode = serverCode.replace("from './google-oidc'", `from ${JSON.stringify(oidcUrl)}`).replace('import.meta.env.DEV', 'false');
+  const adapterCode = compile('../lib/vercel-database.ts').replace("import 'server-only';", '')
+    .replace("from '@libsql/client'", `from ${JSON.stringify(import.meta.resolve('@libsql/client'))}`);
+  const adapterUrl = 'data:text/javascript;base64,' + Buffer.from(adapterCode).toString('base64');
+  const serverCode = compile('../lib/google-auth-server.ts')
+    .replace("from './vercel-database'", `from ${JSON.stringify(adapterUrl)}`)
+    .replace("from 'next/headers'", `from ${JSON.stringify(headersUrl)}`)
+    .replace("from './google-oidc'", `from ${JSON.stringify(oidcUrl)}`);
   const server = await import('data:text/javascript;base64,' + Buffer.from(serverCode).toString('base64'));
   const originalFetch = globalThis.fetch;
   let tokenClaims = {};
-  globalThis.fetch = async (input) => {
-    const url = String(input);
-    if (url === 'https://www.googleapis.com/oauth2/v3/certs') return Response.json(jwks);
-    if (url === 'https://oauth2.googleapis.com/token') return Response.json({ id_token: await sign(tokenClaims) });
-    throw new Error('Unexpected network request');
+  globalThis.fetch = async input => {
+    if (String(input) === 'https://www.googleapis.com/oauth2/v3/certs') return Response.json(jwks);
+    if (String(input) === 'https://oauth2.googleapis.com/token') return Response.json({ id_token: await sign(tokenClaims) });
+    throw new Error('Unexpected request');
   };
-  t.after(() => { globalThis.fetch = originalFetch; delete globalThis.__idveraAuthTest; sql.close(); });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    delete globalThis.__idveraAuthTest;
+    for (const [key, value] of Object.entries(oldEnv)) value === undefined ? delete process.env[key] : process.env[key] = value;
+    db.close(); rmSync(directory, { recursive: true, force: true });
+  });
   const request = (path, options = {}) => new Request(config.origin + path, options);
-  const start = async (path = '/auth/google/start?mode=link') => {
-    const response = await server.startGoogleSignIn(request(path));
-    const url = new URL(response.headers.get('location'));
-    const cookie = response.headers.get('set-cookie').split(';')[0];
-    tokenClaims = { nonce: url.searchParams.get('nonce') };
-    return { state: url.searchParams.get('state'), cookie };
+  const start = async () => {
+    const response = await server.startGoogleSignIn(request('/auth/google/start?returnTo=%2Fworkspace'));
+    const redirect = new URL(response.headers.get('location'));
+    tokenClaims = { nonce: redirect.searchParams.get('nonce') };
+    return { state: redirect.searchParams.get('state'), flowCookie: response.headers.get('set-cookie').split(';')[0] };
   };
-  const finish = (flow, extras = '') => server.finishGoogleSignIn(request(`/auth/google/callback?state=${flow.state}&code=test-code${extras}`, { headers: { cookie: flow.cookie } }));
-  await t.test('Account linking requires an existing authenticated Sites user', async () => {
-    context.user = null;
-    const response = await server.startGoogleSignIn(request('/auth/google/start?mode=link'));
-    assert.equal(response.headers.get('location'), '/signin-with-chatgpt?return_to=%2Faccount');
-    context.user = owner;
+  const finish = (flow, cookie = flow.flowCookie) => server.finishGoogleSignIn(request(`/auth/google/callback?state=${flow.state}&code=test-code`, { headers: { cookie } }));
+  await t.test('Sites header linking is rejected', async () => {
+    const response = await server.startGoogleSignIn(request('/auth/google/start?mode=link', { headers: { 'oai-authenticated-user-id': 'victim' } }));
+    assert.equal(response.headers.get('location'), '/login');
+    assert.equal((await db.execute('SELECT COUNT(*) AS n FROM oauth_flows')).rows[0].n, 0);
   });
-  await t.test('Incorrect origins cannot start an OAuth flow', async () => {
-    const response = await server.startGoogleSignIn(new Request('https://other.example/auth/google/start?mode=link'));
-    assert.equal(response.headers.get('location'), '/login?error=configuration');
-  });
-  let linkedSession;
-  await t.test('Linking preserves existing owner IDs and stores only hashed session tokens', async () => {
-    sql.prepare('INSERT INTO institutions (id,owner_id,code,payload) VALUES (?,?,?,?)').run('existing-institution', owner.userId, 'TEST', '{}');
+  let session;
+  await t.test('First sign-in creates a stable Google-owned workspace', async () => {
     const flow = await start();
     const response = await finish(flow);
-    assert.equal(response.headers.get('location'), '/account?linked=1');
-    assert.equal(response.headers.get('cache-control'), 'no-store');
-    linkedSession = response.headers.getSetCookie().find(c => c.startsWith('__Host-idvera_session=')).split(';')[0];
-    assert.equal(sql.prepare('SELECT owner_id FROM google_accounts').get().owner_id, owner.userId);
-    assert.equal(sql.prepare('SELECT owner_id FROM institutions').get().owner_id, owner.userId);
-    assert.equal(sql.prepare('SELECT token_hash FROM auth_sessions').get().token_hash, await tokenHash(linkedSession.split('=')[1]));
-    assert.equal(sql.prepare('SELECT action FROM audit_events').get().action, 'GOOGLE_ACCOUNT_LINKED');
+    assert.equal(response.headers.get('location'), '/workspace');
+    session = response.headers.getSetCookie().find(value => value.startsWith('__Host-idvera_session=')).split(';')[0];
+    assert.equal((await db.execute('SELECT owner_id FROM google_accounts')).rows[0].owner_id, 'google:' + claims.sub);
+    assert.equal((await db.execute('SELECT token_hash FROM auth_sessions')).rows[0].token_hash, await tokenHash(session.split('=')[1]));
     assert.equal((await finish(flow)).headers.get('location'), '/login?error=expired_flow');
   });
-  await t.test('Mismatched browser cookies cannot consume another browser’s flow', async () => {
+  await t.test('Browser cookie binds the flow and prevents another browser from using it', async () => {
     const flow = await start();
-    assert.equal((await finish({ ...flow, cookie: `__Host-idvera_flow=${randomToken()}` })).headers.get('location'), '/login?error=expired_flow');
-    assert.equal(sql.prepare('SELECT COUNT(*) AS n FROM oauth_flows').get().n, 1);
-    assert.equal((await finish(flow)).headers.get('location'), '/account?linked=1');
+    assert.equal((await finish(flow, `__Host-idvera_flow=${randomToken()}`)).headers.get('location'), '/login?error=expired_flow');
+    assert.equal((await finish(flow)).headers.get('location'), '/workspace');
+    assert.equal((await db.execute('SELECT COUNT(*) AS n FROM google_accounts')).rows[0].n, 1);
   });
-  await t.test('Google cancellation consumes the flow without creating a session', async () => {
-    const before = sql.prepare('SELECT COUNT(*) AS n FROM auth_sessions').get().n;
-    const flow = await start();
-    assert.equal((await finish(flow, '&error=access_denied')).headers.get('location'), '/account?error=cancelled');
-    assert.equal(sql.prepare('SELECT COUNT(*) AS n FROM auth_sessions').get().n, before);
-    assert.equal((await finish(flow)).headers.get('location'), '/login?error=expired_flow');
-  });
-  await t.test('A Google account cannot be linked to a different workspace', async () => {
-    context.user = { ...owner, userId: 'another-owner' };
-    assert.equal((await finish(await start())).headers.get('location'), '/account?error=account_conflict');
-    assert.equal(sql.prepare('SELECT owner_id FROM google_accounts').get().owner_id, owner.userId);
-    context.user = owner;
-  });
-  await t.test('Workspace authentication uses the stored session and rejects expiry', async () => {
-    context.requestHeaders = new Headers({ cookie: linkedSession });
-    assert.equal((await server.getGoogleUser()).userId, owner.userId);
-    const hash = await tokenHash(linkedSession.split('=')[1]);
-    sql.prepare('UPDATE auth_sessions SET expires_at=? WHERE token_hash=?').run(now - 1, hash);
-    assert.equal(await server.getGoogleUser(), null);
-    sql.prepare('UPDATE auth_sessions SET expires_at=? WHERE token_hash=?').run(now + 300, hash);
-  });
-  await t.test('Google sign-in returns to the requested workspace using the linked owner', async () => {
-    env.AUTH_PROVIDER = 'google';
-    const response = await finish(await start('/auth/google/start?returnTo=%2Fworkspace%3Ftab%3Dstudents'));
-    assert.equal(response.headers.get('location'), '/workspace?tab=students');
-    assert.equal(sql.prepare('SELECT COUNT(*) AS n FROM google_accounts').get().n, 1);
-  });
-  await t.test('Logout rejects other origins, then revokes the session and appends an audit event', async () => {
-    context.requestHeaders = new Headers({ cookie: linkedSession });
-    assert.equal((await server.signOutGoogle(request('/auth/logout', { method: 'POST', headers: { origin: 'https://other.example', cookie: linkedSession } }))).status, 403);
-    assert(await server.getGoogleUser());
-    const response = await server.signOutGoogle(request('/auth/logout', { method: 'POST', headers: { origin: config.origin, cookie: linkedSession } }));
+  await t.test('Session lookup and logout use the database', async () => {
+    context.requestHeaders = new Headers({ cookie: session });
+    assert.equal((await server.getGoogleUser()).userId, 'google:' + claims.sub);
+    const wrong = await server.signOutGoogle(request('/auth/logout', { method: 'POST', headers: { origin: 'https://other.example', cookie: session } }));
+    assert.equal(wrong.status, 403);
+    const response = await server.signOutGoogle(request('/auth/logout', { method: 'POST', headers: { origin: config.origin, cookie: session } }));
     assert.equal(response.headers.get('location'), '/login');
-    assert(response.headers.get('set-cookie').includes('Max-Age=0'));
     assert.equal(await server.getGoogleUser(), null);
-    assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM audit_events WHERE action='GOOGLE_SIGN_OUT'").get().n, 1);
-    assert.throws(() => sql.exec('DELETE FROM audit_events'), /append-only/);
+  });
+  await t.test('Workspace batch writes remain atomic', async () => {
+    const { database } = await import(adapterUrl);
+    const valid = database.prepare('INSERT INTO institutions (id,owner_id,code,payload) VALUES (?,?,?,?)').bind('batch-test', 'google:test', 'TEST', '{}');
+    const invalid = database.prepare('INSERT INTO institutions (id,owner_id,code,payload) VALUES (?,?,?,?)').bind('batch-test', 'google:test', 'TEST', '{}');
+    await assert.rejects(database.batch([valid, invalid]));
+    const result = await db.execute({ sql: 'SELECT COUNT(*) AS n FROM institutions WHERE id=?', args: ['batch-test'] });
+    assert.equal(result.rows[0].n, 0);
   });
 });

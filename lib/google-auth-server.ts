@@ -1,16 +1,16 @@
-import { env } from 'cloudflare:workers';
+import { database as siteDatabase } from './vercel-database';
 import { headers } from 'next/headers';
-import { getChatGPTUser, type ChatGPTUser } from '../app/chatgpt-auth';
+import type { ChatGPTUser } from '../app/chatgpt-auth';
 import { authCookie,authCookieName,authorizationRequest,cookieValue,exchangeCode,GoogleAuthError,googleConfig,randomToken,safeReturnTo,tokenHash,verifyGoogleToken,type LoginFlow } from './google-oidc';
 
-type AuthEnv={DB?:D1Database;AUTH_PROVIDER?:string;AUTH_ORIGIN?:string;GOOGLE_CLIENT_ID?:string;GOOGLE_CLIENT_SECRET?:string};
+type AuthEnv={AUTH_ORIGIN?:string;GOOGLE_CLIENT_ID?:string;GOOGLE_CLIENT_SECRET?:string};
 type Account={subject:string;owner_id:string;email:string;display_name:string};
 type FlowRow={state_hash:string;browser_hash:string;nonce:string;verifier:string;return_to:string;link_owner_id:string|null;expires_at:number};
-const variables=()=>env as AuthEnv;
-const database=()=>{const db=variables().DB;if(!db)throw new GoogleAuthError('unavailable');return db;};
+const variables=()=>process.env as AuthEnv;
+const database=()=>siteDatabase;
 const now=()=>Math.floor(Date.now()/1000);
-export function isGoogleAuth(){return variables().AUTH_PROVIDER==='google';}
-export function getGoogleConfig(){return googleConfig(variables(),import.meta.env.DEV);}
+export function isGoogleAuth(){return true;}
+export function getGoogleConfig(){return googleConfig(variables(),process.env.NODE_ENV==='development');}
 function redirectResponse(path:string,status=303){return new Response(null,{status,headers:{Location:path,'Cache-Control':'no-store','Referrer-Policy':'no-referrer'}});}
 function audit(owner:string,actor:string,action:string,detail:string){return database().prepare('INSERT INTO audit_events (id,owner_id,actor,action,entity_id,detail,timestamp) VALUES (?,?,?,?,?,?,?)').bind(crypto.randomUUID(),owner,actor,action,'authentication',detail,new Date().toISOString());}
 export async function getGoogleUser():Promise<ChatGPTUser|null>{
@@ -21,12 +21,11 @@ export async function getGoogleUser():Promise<ChatGPTUser|null>{
 }
 export async function getLinkedAccount(owner:string){return database().prepare('SELECT subject,owner_id,email,display_name FROM google_accounts WHERE owner_id=?').bind(owner).first<Account>();}
 export async function startGoogleSignIn(request:Request){
- const url=new URL(request.url),link=url.searchParams.get('mode')==='link',legacy=link?await getChatGPTUser():null;
- if(link&&!legacy)return redirectResponse('/signin-with-chatgpt?return_to=%2Faccount');
- const config=getGoogleConfig();if(!config)return redirectResponse(link?'/account?error=setup_required':'/login?error=setup_required');
- if(!link&&!isGoogleAuth())return redirectResponse('/account');
+ const url=new URL(request.url);
+ if(url.searchParams.get('mode')==='link')return redirectResponse('/login');
+ const config=getGoogleConfig();if(!config)return redirectResponse('/login?error=setup_required');
  if(url.origin!==config.origin)return redirectResponse('/login?error=configuration');
- const result=await authorizationRequest(config,url.searchParams.get('returnTo'),legacy?.userId||null);
+ const result=await authorizationRequest(config,url.searchParams.get('returnTo'),null);
  const f=result.flow;await database().batch([database().prepare('DELETE FROM oauth_flows WHERE expires_at<=?').bind(now()),database().prepare('INSERT INTO oauth_flows (state_hash,browser_hash,nonce,verifier,return_to,link_owner_id,expires_at) VALUES (?,?,?,?,?,?,?)').bind(f.stateHash,f.browserHash,f.nonce,f.verifier,f.returnTo,f.linkOwnerId,f.expiresAt)]);
  const response=redirectResponse(result.url,302);response.headers.append('Set-Cookie',authCookie('flow',result.browserToken,config.secure,600));return response;
 }
